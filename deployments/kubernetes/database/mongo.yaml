@@ -1,0 +1,90 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: mongo
+  namespace: point-of-sale
+spec:
+  serviceName: "mongo"
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mongo
+  template:
+    metadata:
+      labels:
+        app: mongo
+        tier: mongo
+    spec:
+      serviceAccountName: app
+      automountServiceAccountToken: false
+      securityContext:
+        fsGroup: 999
+      containers:
+        - name: mongo
+          image: mongo:7
+          # Single-node replica set (rs0): multi-document transactions dibutuhkan
+          # agar business write + outbox insert atomik. Client konek dengan
+          # ?replicaSet=rs0&directConnection=true (lihat application.properties).
+          args: ["mongod", "--replSet", "rs0", "--bind_ip_all"]
+          ports:
+            - name: mongo
+              containerPort: 27017
+          # No auth: each service points at this instance with
+          # <MODULE>_DB_HOST/_PORT/_NAME (see core/configmaps.yaml). DB per
+          # bounded-context lives as separate databases inside this instance.
+          volumeMounts:
+            - name: mongo-data
+              mountPath: /data/db
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "100m"
+            limits:
+              memory: "1Gi"
+              cpu: "500m"
+          lifecycle:
+            postStart:
+              exec:
+                # Inisialisasi replica set sekali saja (idempotent). Nama member
+                # pakai DNS in-cluster supaya client di dalam cluster bisa
+                # menemukan node utama.
+                command:
+                  - /bin/bash
+                  - -c
+                  - >
+                    sleep 5;
+                    mongosh --host localhost:27017 --quiet --eval
+                    "try { rs.status() } catch (e) { rs.initiate({_id: 'rs0', members: [{_id: 0, host: 'mongo:27017'}]}) }"
+          readinessProbe:
+            # rs.status() hanya berhasil setelah replica set diinisialisasi.
+            exec:
+              command: ["mongosh", "--quiet", "--eval", "rs.status().ok"]
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            exec:
+              command: ["mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+            initialDelaySeconds: 20
+            periodSeconds: 20
+  volumeClaimTemplates:
+    - metadata:
+        name: mongo-data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 20Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mongo
+  namespace: point-of-sale
+spec:
+  selector:
+    app: mongo
+  ports:
+    - name: mongo
+      port: 27017
+      targetPort: 27017
+  clusterIP: None
